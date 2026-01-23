@@ -3,87 +3,6 @@
 module LegacyAPI
   class DomainsController < BaseController
 
-    # Master override:
-    # - If X-Postal-Master-Key matches ENV["POSTAL_MASTER_API_KEY"],
-    #   requests may operate across all servers in this Postal instance.
-    # - Otherwise, everything remains scoped to @server from X-Server-API-Key.
-    def master_override?
-      master = request.headers["X-Postal-Master-Key"].to_s.strip
-      env_key = ENV["POSTAL_MASTER_API_KEY"].to_s.strip
-      return false if master.empty? || env_key.empty?
-      ActiveSupport::SecurityUtils.secure_compare(master, env_key)
-    end
-
-    def scope_server
-      return @server unless master_override?
-
-      sid = params[:server_id].to_s.strip
-      return @server if sid.empty?
-
-      Server.find_by(id: sid) || @server
-    end
-
-    def find_domain_by_name(name)
-      if master_override?
-        Domain.find_by(name: name)
-      else
-        Domain.find_by(name: name, server: @server)
-      end
-    end
-
-    def serialize_domain(domain)
-      {
-        id: domain.id,
-        name: domain.name,
-        server_id: domain.server_id,
-        verification_method: domain.verification_method,
-        created_at: domain.created_at&.iso8601,
-        updated_at: domain.updated_at&.iso8601,
-        return_path_domain: (domain.return_path_domain rescue nil),
-        dkim_identifier: (domain.dkim_identifier rescue nil),
-        dkim_key: {}
-      }.compact
-    end
-
-    def serialize_dns(domain)
-      expected_spf = "v=spf1 a mx include:spf.mail.yournotify.net ~all"
-
-      dkim_host = nil
-      dkim_value = nil
-
-      begin
-        dkim_host = "#{domain.dkim_identifier}._domainkey"
-      rescue
-      end
-
-      begin
-        # Postal stores a private key internally, UI shows public TXT value derived from it.
-        # For your API response, returning the key body is optional.
-        dkim_value = domain.dkim_key.to_s
-      rescue
-      end
-
-      rp_host = nil
-      begin
-        rp_host = domain.return_path_domain
-      rescue
-      end
-
-      {
-        spf: {
-          expected: expected_spf
-        },
-        dkim: {
-          host: dkim_host,
-          value: dkim_value
-        }.compact,
-        return_path: {
-          host: rp_host,
-          expected_target: "rp.mail.yournotify.net"
-        }.compact
-      }.compact
-    end
-
     def create
       name = params[:name].to_s.strip.downcase
 
@@ -92,32 +11,30 @@ module LegacyAPI
         return
       end
 
-      existing = find_domain_by_name(name)
-      if existing
-        render json: { status: "success", data: serialize_domain(existing) }
+      server = @server
+      if server.nil?
+        render json: { status: "error", message: "Server not found for API key" }, status: 401
         return
       end
 
-      s = scope_server
+      domain = Domain.where("lower(name) = ?", name)
+                     .where(server_id: server.id)
+                     .first
 
-      domain = Domain.new
-      domain.server = s
-      domain.name = name
-
-      # Must match Domain::VERIFICATION_METHODS inclusion validation
-      domain.verification_method = "DNS"
-
-      # These exist in your codebase (domains_api_controller.rb uses them)
-      if domain.respond_to?(:owner_type=) && domain.respond_to?(:owner_id=)
-        domain.owner_type = "Server"
-        domain.owner_id = s.id
+      if domain
+        render json: { status: "success", data: serialize_domain(domain) }
+        return
       end
 
-      # Optional auto-verified behavior. If you want UI to still show unverified until DNS passes, remove this.
-      domain.verified_at = Time.now if domain.respond_to?(:verified_at=)
+      domain = Domain.new
+      domain.name = name
+      domain.server_id = server.id if domain.respond_to?(:server_id=)
+      domain.verification_method = "DNS" if domain.respond_to?(:verification_method=)
+      domain.owner_type = "Server" if domain.respond_to?(:owner_type=)
+      domain.owner_id = server.id if domain.respond_to?(:owner_id=)
 
       if domain.save
-        render json: { status: "success", data: serialize_domain(domain) }
+        render json: { status: "success", data: serialize_domain(domain) }, status: 201
       else
         render json: { status: "error", message: domain.errors.full_messages.join(", ") }, status: 422
       end
@@ -125,7 +42,19 @@ module LegacyAPI
 
     def query
       name = params[:name].to_s.strip.downcase
-      domain = find_domain_by_name(name)
+
+      if name.empty?
+        render json: { status: "error", message: "Domain name is required" }, status: 422
+        return
+      end
+
+      server = @server
+      if server.nil?
+        render json: { status: "error", message: "Server not found for API key" }, status: 401
+        return
+      end
+
+      domain = find_domain(name)
 
       unless domain
         render json: { status: "error", message: "Domain not found" }, status: 404
@@ -137,25 +66,51 @@ module LegacyAPI
 
     def check
       name = params[:name].to_s.strip.downcase
-      domain = find_domain_by_name(name)
+
+      if name.empty?
+        render json: { status: "error", message: "Domain name is required" }, status: 422
+        return
+      end
+
+      server = @server
+      if server.nil?
+        render json: { status: "error", message: "Server not found for API key" }, status: 401
+        return
+      end
+
+      domain = find_domain(name)
 
       unless domain
         render json: { status: "error", message: "Domain not found" }, status: 404
         return
       end
 
-      # Kick off Postal DNS checks, then return expected records payload
-      domain.check_dns(:manual) if domain.respond_to?(:check_dns)
+      begin
+        domain.check_dns(:manual) if domain.respond_to?(:check_dns)
+      rescue
+      end
 
-      render json: {
-        status: "success",
-        data: serialize_domain(domain).merge(dns: serialize_dns(domain))
-      }
+      data = serialize_domain(domain)
+      data[:dns] = serialize_dns(domain)
+
+      render json: { status: "success", data: data }
     end
 
     def delete
       name = params[:name].to_s.strip.downcase
-      domain = find_domain_by_name(name)
+
+      if name.empty?
+        render json: { status: "error", message: "Domain name is required" }, status: 422
+        return
+      end
+
+      server = @server
+      if server.nil?
+        render json: { status: "error", message: "Server not found for API key" }, status: 401
+        return
+      end
+
+      domain = find_domain(name)
 
       unless domain
         render json: { status: "error", message: "Domain not found" }, status: 404
@@ -164,6 +119,86 @@ module LegacyAPI
 
       domain.destroy
       render json: { status: "success", message: "Domain deleted" }
+    end
+
+    private
+
+    def find_domain(name)
+      server = @server
+      return nil unless server
+
+      domain = Domain.where("lower(name) = ?", name)
+                     .where(server_id: server.id)
+                     .first
+      return domain if domain
+
+      orphan = Domain.where("lower(name) = ?", name)
+                     .where(server_id: nil)
+                     .first
+
+      if orphan
+        begin
+          orphan.server_id = server.id if orphan.respond_to?(:server_id=)
+          orphan.save(validate: false)
+        rescue
+        end
+        return orphan
+      end
+
+      nil
+    end
+
+    def serialize_domain(domain)
+      out = {
+        id: domain.id,
+        name: domain.name,
+        server_id: domain.server_id,
+        verification_method: domain.verification_method
+      }
+
+      out[:created_at] = domain.created_at if domain.respond_to?(:created_at)
+      out[:updated_at] = domain.updated_at if domain.respond_to?(:updated_at)
+      out[:return_path_domain] = domain.return_path_domain if domain.respond_to?(:return_path_domain)
+      out[:dkim_identifier] = domain.dkim_identifier if domain.respond_to?(:dkim_identifier)
+      out[:dkim_key] = {} if domain.respond_to?(:dkim_key)
+
+      out
+    end
+
+    def serialize_dns(domain)
+      dns = {}
+
+      begin
+        if domain.respond_to?(:check_spf_record)
+          spf = domain.check_spf_record
+          dns[:spf] = { expected: spf[:expected] } if spf.is_a?(Hash)
+        end
+      rescue
+      end
+
+      begin
+        if domain.respond_to?(:check_dkim_record)
+          dkim = domain.check_dkim_record
+          dns[:dkim] = {
+            host: dkim[:host],
+            expected: dkim[:expected]
+          }.compact if dkim.is_a?(Hash)
+        end
+      rescue
+      end
+
+      begin
+        if domain.respond_to?(:check_return_path_record)
+          rp = domain.check_return_path_record
+          dns[:return_path] = {
+            host: rp[:host],
+            expected_target: rp[:expected]
+          }.compact if rp.is_a?(Hash)
+        end
+      rescue
+      end
+
+      dns
     end
   end
 end

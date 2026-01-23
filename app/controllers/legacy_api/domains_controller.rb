@@ -3,142 +3,167 @@
 module LegacyAPI
   class DomainsController < BaseController
 
+    # Master override:
+    # - If X-Postal-Master-Key matches ENV["POSTAL_MASTER_API_KEY"],
+    #   requests may operate across all servers in this Postal instance.
+    # - Otherwise, everything remains scoped to @server from X-Server-API-Key.
+    def master_override?
+      master = request.headers["X-Postal-Master-Key"].to_s.strip
+      env_key = ENV["POSTAL_MASTER_API_KEY"].to_s.strip
+      return false if master.empty? || env_key.empty?
+      ActiveSupport::SecurityUtils.secure_compare(master, env_key)
+    end
+
+    def scope_server
+      return @server unless master_override?
+
+      sid = params[:server_id].to_s.strip
+      return @server if sid.empty?
+
+      Server.find_by(id: sid) || @server
+    end
+
+    def find_domain_by_name(name)
+      if master_override?
+        Domain.find_by(name: name)
+      else
+        Domain.find_by(name: name, server: @server)
+      end
+    end
+
+    def serialize_domain(domain)
+      {
+        id: domain.id,
+        name: domain.name,
+        server_id: domain.server_id,
+        verification_method: domain.verification_method,
+        created_at: domain.created_at&.iso8601,
+        updated_at: domain.updated_at&.iso8601,
+        return_path_domain: (domain.return_path_domain rescue nil),
+        dkim_identifier: (domain.dkim_identifier rescue nil),
+        dkim_key: {}
+      }.compact
+    end
+
+    def serialize_dns(domain)
+      expected_spf = "v=spf1 a mx include:spf.mail.yournotify.net ~all"
+
+      dkim_host = nil
+      dkim_value = nil
+
+      begin
+        dkim_host = "#{domain.dkim_identifier}._domainkey"
+      rescue
+      end
+
+      begin
+        # Postal stores a private key internally, UI shows public TXT value derived from it.
+        # For your API response, returning the key body is optional.
+        dkim_value = domain.dkim_key.to_s
+      rescue
+      end
+
+      rp_host = nil
+      begin
+        rp_host = domain.return_path_domain
+      rescue
+      end
+
+      {
+        spf: {
+          expected: expected_spf
+        },
+        dkim: {
+          host: dkim_host,
+          value: dkim_value
+        }.compact,
+        return_path: {
+          host: rp_host,
+          expected_target: "rp.mail.yournotify.net"
+        }.compact
+      }.compact
+    end
+
     def create
       name = params[:name].to_s.strip.downcase
 
       if name.empty?
-        return render json: { status: "error", message: "Domain name is required" }, status: 422
+        render json: { status: "error", message: "Domain name is required" }, status: 422
+        return
       end
 
-      domain = Domain.find_by(name: name, server: @server)
-      if domain
-        return render json: {
-          status: "success",
-          data: serialize_domain(domain)
-        }
+      existing = find_domain_by_name(name)
+      if existing
+        render json: { status: "success", data: serialize_domain(existing) }
+        return
       end
+
+      s = scope_server
 
       domain = Domain.new
-      domain.server = @server
+      domain.server = s
       domain.name = name
 
-      # Tracking domains use TXT ownership verification in the UI.
-      # Keep method as DNS so Postal shows the normal flow.
-      domain.verification_method = "DNS" if domain.respond_to?(:verification_method)
+      # Must match Domain::VERIFICATION_METHODS inclusion validation
+      domain.verification_method = "DNS"
 
-      # Owner fields exist in Postal tracking domains
+      # These exist in your codebase (domains_api_controller.rb uses them)
       if domain.respond_to?(:owner_type=) && domain.respond_to?(:owner_id=)
         domain.owner_type = "Server"
-        domain.owner_id = @server.id
+        domain.owner_id = s.id
       end
 
+      # Optional auto-verified behavior. If you want UI to still show unverified until DNS passes, remove this.
+      domain.verified_at = Time.now if domain.respond_to?(:verified_at=)
+
       if domain.save
-        render json: {
-          status: "success",
-          data: serialize_domain(domain)
-        }
+        render json: { status: "success", data: serialize_domain(domain) }
       else
-        render json: {
-          status: "error",
-          message: domain.errors.full_messages.join(", ")
-        }, status: 422
+        render json: { status: "error", message: domain.errors.full_messages.join(", ") }, status: 422
       end
     end
 
     def query
       name = params[:name].to_s.strip.downcase
-      domain = Domain.find_by(name: name, server: @server)
+      domain = find_domain_by_name(name)
 
       unless domain
-        return render json: { status: "error", message: "Domain not found" }, status: 404
+        render json: { status: "error", message: "Domain not found" }, status: 404
+        return
       end
 
-      render json: {
-        status: "success",
-        data: serialize_domain(domain)
-      }
+      render json: { status: "success", data: serialize_domain(domain) }
     end
 
     def check
       name = params[:name].to_s.strip.downcase
-      domain = Domain.find_by(name: name, server: @server)
+      domain = find_domain_by_name(name)
 
       unless domain
-        return render json: { status: "error", message: "Domain not found" }, status: 404
+        render json: { status: "error", message: "Domain not found" }, status: 404
+        return
       end
 
-      # Run Postal’s DNS check so you get the same expectations your UI uses
-      checks = DomainDNSChecker.check(domain)
-
-      # Optional: if the TXT ownership record is now valid, auto-mark verified.
-      # This removes the need for the user to click “Verify TXT record”.
-      # We try to detect a pass condition from the checker response safely.
-      if domain.respond_to?(:verified_at) && domain.verified_at.nil?
-        if ownership_verified_from_checks?(checks)
-          domain.update_column(:verified_at, Time.now)
-        end
-      end
+      # Kick off Postal DNS checks, then return expected records payload
+      domain.check_dns(:manual) if domain.respond_to?(:check_dns)
 
       render json: {
         status: "success",
-        data: serialize_domain(domain).merge(dns: checks)
+        data: serialize_domain(domain).merge(dns: serialize_dns(domain))
       }
     end
 
     def delete
       name = params[:name].to_s.strip.downcase
-      domain = Domain.find_by(name: name, server: @server)
+      domain = find_domain_by_name(name)
 
       unless domain
-        return render json: { status: "error", message: "Domain not found" }, status: 404
+        render json: { status: "error", message: "Domain not found" }, status: 404
+        return
       end
 
       domain.destroy
-
-      render json: {
-        status: "success",
-        data: { message: "Domain deleted" }
-      }
-    end
-
-    private
-
-    def serialize_domain(domain)
-      payload = {
-        id: domain.id,
-        name: domain.name,
-        server_id: domain.respond_to?(:server_id) ? domain.server_id : @server.id,
-        verification_method: domain.respond_to?(:verification_method) ? domain.verification_method : nil,
-        created_at: domain.respond_to?(:created_at) ? domain.created_at&.iso8601 : nil,
-        updated_at: domain.respond_to?(:updated_at) ? domain.updated_at&.iso8601 : nil,
-        verified_at: domain.respond_to?(:verified_at) ? domain.verified_at&.iso8601 : nil
-      }.compact
-
-      if domain.respond_to?(:return_path_domain) && domain.return_path_domain.present?
-        payload[:return_path_domain] = domain.return_path_domain
-      end
-
-      if domain.respond_to?(:dkim_identifier) && domain.dkim_identifier.present?
-        payload[:dkim_identifier] = domain.dkim_identifier
-      end
-
-      payload
-    end
-
-    def ownership_verified_from_checks?(checks)
-      return false unless checks.is_a?(Hash)
-
-      # Try common shapes without breaking if Postal changes the response.
-      # If DomainDNSChecker returns a verification section, prefer it.
-      verification = checks["verification"] || checks[:verification]
-      if verification.is_a?(Hash)
-        ok = verification["ok"]
-        ok = verification[:ok] if ok.nil?
-        return true if ok == true
-      end
-
-      # Fallback: if no explicit verification field exists, do nothing.
-      false
+      render json: { status: "success", message: "Domain deleted" }
     end
   end
 end

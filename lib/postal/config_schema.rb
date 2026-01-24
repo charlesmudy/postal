@@ -411,7 +411,7 @@ module Postal
 
       string :from_name do
         description "The name to use as the from name outgoing emails from Postal"
-        default "Postal"
+        default "Yournotify"
       end
 
       string :from_address do

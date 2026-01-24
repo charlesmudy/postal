@@ -173,7 +173,7 @@ This file contains all the latest changes and updates to Postal.
 
 ## [3.0.0](https://github.com/postalserver/postal/compare/2.3.2...3.0.0) (2024-03-04)
 
-This version of Postal introduces a number of larger changes. Please be sure to follow the [upgrade guide](https://docs.postalserver.io/getting-started/upgrade-to-v3) when upgrading to Postal v3. Highlights include:
+This version of Postal introduces a number of larger changes. Please be sure to follow the [upgrade guide](https://yournotify.com/getting-started/upgrade-to-v3) when upgrading to Postal v3. Highlights include:
 
 * Removal of RabbitMQ dependency
 * Removal of `cron` and `requeuer` processes

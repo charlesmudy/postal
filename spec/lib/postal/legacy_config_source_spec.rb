@@ -262,7 +262,7 @@ module Postal
       end
 
       it "returns a value for smtp.from_name" do
-        expect(config.smtp.from_name).to eq "Postal"
+        expect(config.smtp.from_name).to eq "Yournotify"
       end
 
       it "returns a value for smtp.from_address" do
